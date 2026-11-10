@@ -1,0 +1,376 @@
+package com.smartcity.traffic;
+
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+
+/**
+ * Manages vehicle spawning, physics updates, queue spacing behind stop lines,
+ * collision avoidance, intersection traversal, and exit disposal.
+ */
+public class VehicleManager {
+    private final Map<RoadDirection, Road> roads;
+    private final EmergencyManager emergencyManager;
+    private long vehicleIdCounter = 1;
+    private int totalEmergencyVehiclesCompleted;
+
+    // Simulation dimensions (updated dynamically by CityMapPanel)
+    private int panelWidth = 800;
+    private int panelHeight = 700;
+    private int centerX = 400;
+    private int centerY = 350;
+    private final int roadWidth = 130; // 65px per side
+    private final int stopLineDistance = 70; // Distance from center to stop line
+
+    private final Random random = new Random();
+
+    public VehicleManager(Map<RoadDirection, Road> roads, EmergencyManager emergencyManager) {
+        this.roads = roads;
+        this.emergencyManager = emergencyManager;
+    }
+
+    public void setDimensions(int width, int height) {
+        this.panelWidth = width;
+        this.panelHeight = height;
+        this.centerX = width / 2;
+        this.centerY = height / 2;
+
+        // Update stop lines on roads
+        roads.get(RoadDirection.NORTH).setStopLineCoord(centerY - stopLineDistance);
+        roads.get(RoadDirection.SOUTH).setStopLineCoord(centerY + stopLineDistance);
+        roads.get(RoadDirection.EAST).setStopLineCoord(centerX + stopLineDistance);
+        roads.get(RoadDirection.WEST).setStopLineCoord(centerX - stopLineDistance);
+    }
+
+    /**
+     * Spawns a regular vehicle on the given road if logical remaining count exceeds active visible vehicles.
+     */
+    public synchronized void spawnVehicleIfNeeded(RoadDirection direction) {
+        Road road = roads.get(direction);
+        if (road == null) return;
+
+        // Ensure we don't spawn more than the logical remaining vehicles
+        int visibleCount = road.getActiveVehicles().size();
+        if (visibleCount >= road.getRemainingCount() || visibleCount >= 12) {
+            return; // Throttle visual density to prevent off-screen overflow
+        }
+
+        // Check if there is enough space at the road entry point
+        if (!hasSpaceAtSpawnPoint(direction)) {
+            return;
+        }
+
+        // Randomly pick a vehicle type with realistic city distribution
+        int roll = random.nextInt(100);
+        Vehicle vehicle;
+        String id = "V-" + (vehicleIdCounter++);
+        int laneIndex = random.nextInt(2); // 0 = inner, 1 = outer
+
+        if (roll < 45) {
+            // Car
+            Color[] carColors = {
+                new Color(41, 128, 185), new Color(231, 76, 60), new Color(46, 204, 113),
+                new Color(241, 196, 15), new Color(52, 73, 94), new Color(236, 240, 241)
+            };
+            vehicle = new Car(id, direction, carColors[random.nextInt(carColors.length)], laneIndex);
+        } else if (roll < 65) {
+            // Motorcycle
+            Color[] bikeColors = { new Color(192, 57, 43), new Color(41, 128, 185), new Color(39, 174, 96), new Color(30, 30, 30) };
+            vehicle = new Motorcycle(id, direction, bikeColors[random.nextInt(bikeColors.length)], laneIndex);
+        } else if (roll < 80) {
+            // Auto-Rickshaw
+            vehicle = new AutoRickshaw(id, direction, laneIndex);
+        } else if (roll < 92) {
+            // City Bus
+            Color[] busColors = { new Color(230, 126, 34), new Color(52, 152, 219), new Color(39, 174, 96) };
+            vehicle = new Bus(id, direction, busColors[random.nextInt(busColors.length)], 1); // buses prefer outer lane
+        } else {
+            // Freight Truck
+            Color[] truckColors = { new Color(127, 140, 141), new Color(142, 68, 173), new Color(211, 84, 0) };
+            vehicle = new Truck(id, direction, truckColors[random.nextInt(truckColors.length)], 1);
+        }
+
+        initializeVehiclePosition(vehicle, direction, laneIndex);
+        road.getActiveVehicles().add(vehicle);
+    }
+
+    /**
+     * Injects an emergency priority vehicle on the specified road.
+     */
+    public synchronized void spawnEmergencyVehicle(RoadDirection direction, String type) {
+        Road road = roads.get(direction);
+        if (road == null) return;
+
+        String id = "EMERG-" + (vehicleIdCounter++);
+        int laneIndex = 0; // Emergency vehicles use inner fast lane
+
+        EmergencyVehicle ev;
+        if ("Ambulance".equalsIgnoreCase(type)) {
+            ev = new Ambulance(id, direction, laneIndex);
+        } else if ("Fire Engine".equalsIgnoreCase(type) || "Fire".equalsIgnoreCase(type)) {
+            ev = new FireEngine(id, direction, laneIndex);
+        } else {
+            ev = new PoliceVehicle(id, direction, laneIndex);
+        }
+
+        initializeVehiclePosition(ev, direction, laneIndex);
+        road.getActiveVehicles().add(0, ev); // Insert near front or queue
+
+        // Enqueue in FIFO emergency manager
+        EmergencyManager.EmergencyRequest request = new EmergencyManager.EmergencyRequest(id, direction, type, ev);
+        emergencyManager.enqueueRequest(request);
+        road.incrementEmergencyCount();
+    }
+
+    private void initializeVehiclePosition(Vehicle vehicle, RoadDirection direction, int laneIndex) {
+        int laneOffset = (laneIndex == 0) ? 18 : 50; // Keep vehicle bodies separated inside each 70px road half
+        switch (direction) {
+            case NORTH -> {
+                vehicle.setX(centerX - laneOffset);
+                vehicle.setY(-vehicle.getLength() - 10);
+            }
+            case SOUTH -> {
+                vehicle.setX(centerX + laneOffset);
+                vehicle.setY(panelHeight + vehicle.getLength() + 10);
+            }
+            case EAST -> {
+                vehicle.setX(panelWidth + vehicle.getLength() + 10);
+                vehicle.setY(centerY - laneOffset);
+            }
+            case WEST -> {
+                vehicle.setX(-vehicle.getLength() - 10);
+                vehicle.setY(centerY + laneOffset);
+            }
+        }
+    }
+
+    private boolean hasSpaceAtSpawnPoint(RoadDirection direction) {
+        Road road = roads.get(direction);
+        for (Vehicle v : road.getActiveVehicles()) {
+            double dist = switch (direction) {
+                case NORTH -> v.getY();
+                case SOUTH -> panelHeight - v.getY();
+                case EAST  -> panelWidth - v.getX();
+                case WEST  -> v.getX();
+            };
+            if (dist < 45) {
+                return false; // Vehicle too close to spawn threshold
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Core animation and physics loop:
+     * - Evaluates signal states & stop lines
+     * - Enforces safe vehicle-following buffer
+     * - Permits vehicles inside intersection to clear freely
+     * - Decrements remaining count on completed exit
+     */
+    public synchronized void updateVehicles() {
+        for (RoadDirection dir : RoadDirection.values()) {
+            Road road = roads.get(dir);
+            if (road == null) continue;
+
+            List<Vehicle> vehicleList = road.getActiveVehicles();
+            TrafficSignal signal = road.getSignal();
+            double stopLine = road.getStopLineCoord();
+
+            // Iterate through vehicles on this road
+            Iterator<Vehicle> iterator = vehicleList.iterator();
+            while (iterator.hasNext()) {
+                Vehicle v = iterator.next();
+                Vehicle leadVehicle = findVehicleAheadInLane(road, v);
+
+                double targetSpeed = v.getMaxSpeed();
+                boolean isEmergencyPriorityActive = v.isEmergency() && 
+                    emergencyManager.getActiveRequest() != null && 
+                    emergencyManager.getActiveRequest().getVehicle() == v;
+
+                // Check position relative to stop line
+                boolean pastStopLine = switch (dir) {
+                    case NORTH -> v.getFrontEdge() >= stopLine;
+                    case SOUTH -> v.getFrontEdge() <= stopLine;
+                    case EAST  -> v.getFrontEdge() <= stopLine;
+                    case WEST  -> v.getFrontEdge() >= stopLine;
+                };
+
+                // Check if vehicle has cleared intersection
+                boolean clearedIntersection = switch (dir) {
+                    case NORTH -> v.getRearEdge() > (centerY + stopLineDistance);
+                    case SOUTH -> v.getRearEdge() < (centerY - stopLineDistance);
+                    case EAST  -> v.getRearEdge() < (centerX - stopLineDistance);
+                    case WEST  -> v.getRearEdge() > (centerX + stopLineDistance);
+                };
+
+                // State transitions
+                if (clearedIntersection) {
+                    v.setState(Vehicle.State.EXITED);
+                } else if (pastStopLine) {
+                    // VEHICLE IS INSIDE INTERSECTION: MUST NOT STOP EVEN IF SIGNAL TURNS RED
+                    v.setState(Vehicle.State.CROSSING);
+                }
+
+                // Determine target speed based on traffic laws
+                if (v.getState() == Vehicle.State.CROSSING || v.getState() == Vehicle.State.EXITED) {
+                    // Inside intersection or exiting: full speed ahead
+                    targetSpeed = v.getMaxSpeed();
+                } else {
+                    // Vehicle is approaching or waiting before stop line
+                    double distToStopLine = switch (dir) {
+                        case NORTH -> stopLine - v.getFrontEdge();
+                        case SOUTH -> v.getFrontEdge() - stopLine;
+                        case EAST  -> v.getFrontEdge() - stopLine;
+                        case WEST  -> stopLine - v.getFrontEdge();
+                    };
+
+                    boolean canPassSignal = signal.isGreen() || isEmergencyPriorityActive;
+
+                    if (!canPassSignal && distToStopLine > 0 && distToStopLine < 140) {
+                        // Approach stop line: decelerate smoothly to zero
+                        if (distToStopLine < 6) {
+                            targetSpeed = 0.0;
+                            v.setState(Vehicle.State.WAITING);
+                        } else {
+                            targetSpeed = Math.min(v.getMaxSpeed(), distToStopLine * 0.05);
+                            if (distToStopLine < 20) {
+                                targetSpeed = Math.min(targetSpeed, 0.5);
+                            }
+                        }
+                    } else if (canPassSignal) {
+                        v.setState(Vehicle.State.APPROACHING);
+                    }
+                }
+
+                // Intersection reservation: perpendicular traffic must wait while another
+                // direction is crossing. This prevents vehicles from driving through each other.
+                boolean perpendicularTrafficInside = isIntersectionOccupiedByOtherDirection(dir);
+                double approachDistance = switch (dir) {
+                    case NORTH -> stopLine - v.getFrontEdge();
+                    case SOUTH -> v.getFrontEdge() - stopLine;
+                    case EAST  -> v.getFrontEdge() - stopLine;
+                    case WEST  -> stopLine - v.getFrontEdge();
+                };
+                if (perpendicularTrafficInside && v.getState() != Vehicle.State.CROSSING
+                        && approachDistance > 0 && approachDistance < 115) {
+                    targetSpeed = 0.0;
+                    v.setState(Vehicle.State.WAITING);
+                }
+
+                // Safe Following Distance behind vehicle ahead
+                if (leadVehicle != null) {
+                    double gap = getDistanceBetweenVehicles(dir, v, leadVehicle);
+                    double safeBuffer = v.getLength() + 14;
+
+                    if (gap < safeBuffer) {
+                        if (gap <= 4) {
+                            targetSpeed = 0.0;
+                            if (v.getState() != Vehicle.State.CROSSING) {
+                                v.setState(Vehicle.State.WAITING);
+                            }
+                        } else {
+                            // Match or brake behind lead vehicle
+                            targetSpeed = Math.min(targetSpeed, leadVehicle.getCurrentSpeed() * 0.85);
+                        }
+                    }
+                }
+
+                // Update vehicle physics
+                v.updatePhysics(targetSpeed);
+
+                // Detect when vehicle is off-screen (journey completed)
+                boolean offScreen = switch (dir) {
+                    case NORTH -> v.getY() > (panelHeight + 60);
+                    case SOUTH -> v.getY() < -60;
+                    case EAST  -> v.getX() < -60;
+                    case WEST  -> v.getX() > (panelWidth + 60);
+                };
+
+                if (offScreen) {
+                    iterator.remove();
+                    road.recordVehicleExit(); // DECREMENT REMAINING COUNTER (e.g. 20 -> 19 -> 18)
+
+                    // If emergency vehicle exited, update emergency manager
+                    if (v.isEmergency()) {
+                        totalEmergencyVehiclesCompleted++;
+                        road.decrementEmergencyCount();
+                        if (emergencyManager.getActiveRequest() != null && 
+                            emergencyManager.getActiveRequest().getVehicle() == v) {
+                            emergencyManager.setActiveRequest(null);
+                            emergencyManager.setClearingIntersectionForEmergency(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private Vehicle findVehicleAheadInLane(Road road, Vehicle current) {
+        Vehicle closest = null;
+        double minDistance = Double.MAX_VALUE;
+
+        for (Vehicle other : road.getActiveVehicles()) {
+            if (other == current) continue;
+            if (other.getLaneIndex() != current.getLaneIndex()) continue;
+
+            double dist = getDistanceBetweenVehicles(current.getOriginDirection(), current, other);
+            if (dist > 0 && dist < minDistance) {
+                minDistance = dist;
+                closest = other;
+            }
+        }
+        return closest;
+    }
+
+    private double getDistanceBetweenVehicles(RoadDirection dir, Vehicle rear, Vehicle front) {
+        return switch (dir) {
+            case NORTH -> front.getRearEdge() - rear.getFrontEdge();
+            case SOUTH -> rear.getFrontEdge() - front.getRearEdge();
+            case EAST  -> rear.getFrontEdge() - front.getRearEdge();
+            case WEST  -> front.getRearEdge() - rear.getFrontEdge();
+        };
+    }
+
+    /**
+     * Returns true when a vehicle from a perpendicular road is already crossing.
+     * Same-direction lanes may continue together, but perpendicular flows are serialized.
+     */
+    private boolean isIntersectionOccupiedByOtherDirection(RoadDirection direction) {
+        for (Map.Entry<RoadDirection, Road> entry : roads.entrySet()) {
+            if (entry.getKey() == direction) continue;
+            boolean perpendicular = (direction == RoadDirection.NORTH || direction == RoadDirection.SOUTH)
+                    ? (entry.getKey() == RoadDirection.EAST || entry.getKey() == RoadDirection.WEST)
+                    : (entry.getKey() == RoadDirection.NORTH || entry.getKey() == RoadDirection.SOUTH);
+            if (!perpendicular) continue;
+            for (Vehicle vehicle : entry.getValue().getActiveVehicles()) {
+                if (vehicle.getState() == Vehicle.State.CROSSING) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks if any vehicle is currently inside the central intersection square.
+     */
+    public boolean isIntersectionOccupied() {
+        for (Road road : roads.values()) {
+            for (Vehicle v : road.getActiveVehicles()) {
+                if (v.getState() == Vehicle.State.CROSSING) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public synchronized int getTotalEmergencyVehiclesCompleted() {
+        return totalEmergencyVehiclesCompleted;
+    }
+
+    public synchronized void resetAll() {
+        totalEmergencyVehiclesCompleted = 0;
+        for (Road road : roads.values()) {
+            road.getActiveVehicles().clear();
+        }
+    }
+}
